@@ -19,6 +19,12 @@ import {
   saveThreadActiveState,
 } from '@/utils/offline-store';
 import { scrollToMessage } from '@/utils/scrollToMessage';
+import {
+  peekPendingTeleport,
+  resolvePendingTeleport,
+  shouldLoadOlderForTeleport,
+  TELEPORT_RESOLVE_EVENT,
+} from '@/utils/teleport';
 
 type SavedScrollState = {
   top: number;
@@ -87,6 +93,7 @@ type MessageExtra = NonNullable<ChatMessageData['extra']>;
 type MessageRichPayload = MessageExtra['rich'];
 
 function getHistoryInvocationId(msg: ChatMessageData): string | undefined {
+  if (msg.extra?.isExplicitPost) return undefined;
   return getBubbleInvocationId(msg);
 }
 
@@ -95,6 +102,7 @@ export function getLocalPlaceholderInvocationId(
   msg: ChatMessageData,
   currentCatInvocations: Record<string, CatInvocationInfo>,
 ): string | undefined {
+  if (msg.extra?.isExplicitPost) return undefined;
   // F194 Phase Z3 P1-2 (砚砚 R): MUST share `getBubbleInvocationId` priority order
   // (turnInvocationId > invocationId > draft id slice). Otherwise current/local placeholder uses
   // parent key while history bubble uses turn key → 刷新前后 merge 路径不一致。
@@ -168,6 +176,9 @@ function mergeMessageExtra(
   const cliDiagnostics = preferred?.cliDiagnostics ?? fallback?.cliDiagnostics;
   const governanceBlocked = preferred?.governanceBlocked ?? fallback?.governanceBlocked;
   const systemKind = preferred?.systemKind ?? fallback?.systemKind;
+  // #814 P2: preserve isExplicitPost so F5/thread-switch doesn't lose the
+  // "don't merge by invocation" semantic for explicit post_message callbacks.
+  const isExplicitPost = preferred?.isExplicitPost ?? fallback?.isExplicitPost;
   if (
     !rich &&
     !crossPost &&
@@ -177,7 +188,8 @@ function mergeMessageExtra(
     !timeoutDiagnostics &&
     !cliDiagnostics &&
     !governanceBlocked &&
-    !systemKind
+    !systemKind &&
+    !isExplicitPost
   ) {
     return undefined;
   }
@@ -191,6 +203,7 @@ function mergeMessageExtra(
     ...(cliDiagnostics ? { cliDiagnostics } : {}),
     ...(governanceBlocked ? { governanceBlocked } : {}),
     ...(systemKind ? { systemKind } : {}),
+    ...(isExplicitPost ? { isExplicitPost: true as const } : {}),
   };
 }
 
@@ -680,6 +693,11 @@ export function useChatHistory(threadId: string) {
               stream?: { invocationId?: string };
               scheduler?: SchedulerMessageExtra['scheduler'];
               systemKind?: 'a2a_routing';
+              /** #814: explicit post_message bypass — survives hydration so F5/thread-switch
+               *  preserves the "don't merge by invocation" semantic. */
+              isExplicitPost?: boolean;
+              /** #814: direction pills — persisted by API, must survive hydration. */
+              targetCats?: string[];
               /** F212 Phase B: history-loader path may already carry cliDiagnostics under
                *  extra (when client wrote it via active-path) — prefer it over metadata copy. */
               cliDiagnostics?: CliDiagnostics;
@@ -729,6 +747,8 @@ export function useChatHistory(threadId: string) {
                   m.extra?.stream ||
                   m.extra?.scheduler ||
                   m.extra?.systemKind ||
+                  m.extra?.isExplicitPost ||
+                  m.extra?.targetCats ||
                   cliDiag;
                 if (!hasExtraField) return {};
                 return {
@@ -738,6 +758,8 @@ export function useChatHistory(threadId: string) {
                     ...(m.extra?.stream ? { stream: m.extra.stream } : {}),
                     ...(m.extra?.scheduler ? { scheduler: m.extra.scheduler } : {}),
                     ...(m.extra?.systemKind ? { systemKind: m.extra.systemKind } : {}),
+                    ...(m.extra?.isExplicitPost ? { isExplicitPost: true as const } : {}),
+                    ...(m.extra?.targetCats ? { targetCats: m.extra.targetCats } : {}),
                     ...(cliDiag ? { cliDiagnostics: cliDiag } : {}),
                   },
                 };
@@ -1318,6 +1340,52 @@ export function useChatHistory(threadId: string) {
     const targetId = resolveCrossPostScrollTarget(threadId, messages, { authoritative: !isOfflineSnapshot });
     if (targetId) scheduleScrollToMessage(targetId);
   }, [messages, threadId, isOfflineSnapshot, scheduleScrollToMessage]);
+
+  // F227: resolve a pending teleport (from cat_cafe_teleport → Event Memory) the
+  // same way as cross-post — across the tentative IDB snapshot + the authoritative
+  // fresh page. Takes a real messageId directly (no invocationId lookup).
+  // P1-1/P1 (砚砚): resolve a pending teleport — scroll if the target is loaded, else
+  // auto-load older pages (full-corpus events can be older than the loaded 50-msg window).
+  // Only finalize a miss (consume + give up) when this is the authoritative fresh page AND
+  // no older history remains. Reused by the messages-effect (cross-thread nav + the
+  // auto-load chain) and an explicit kick (same-thread teleport, where no route changes).
+  const resolveTeleport = useCallback(() => {
+    if (messages.length === 0) return;
+    if (useChatStore.getState().currentThreadId !== threadId) return;
+    const targetId = resolvePendingTeleport(
+      threadId,
+      messages.map((m) => m.id),
+      { authoritative: !isOfflineSnapshot && !hasMore },
+    );
+    if (targetId) {
+      scheduleScrollToMessage(targetId);
+      return;
+    }
+    if (
+      shouldLoadOlderForTeleport({
+        hasPending: peekPendingTeleport(threadId) !== null,
+        found: false,
+        isStale: isOfflineSnapshot,
+        hasMore,
+        isLoading: isLoadingHistory,
+      })
+    ) {
+      const oldest = messages.find((m) => !m.id.startsWith('draft-'));
+      if (oldest) void fetchHistory(`${oldest.deliveredAt ?? oldest.timestamp}:${oldest.id}`);
+    }
+  }, [messages, threadId, isOfflineSnapshot, hasMore, isLoadingHistory, scheduleScrollToMessage, fetchHistory]);
+
+  useEffect(() => {
+    resolveTeleport();
+  }, [resolveTeleport]);
+
+  // Same-thread teleport doesn't change the route, so the effect above never re-fires;
+  // the kick (cat_cafe_teleport / timeline same-thread click) re-runs the SAME resolver.
+  useEffect(() => {
+    const handler = () => resolveTeleport();
+    window.addEventListener(TELEPORT_RESOLVE_EVENT, handler);
+    return () => window.removeEventListener(TELEPORT_RESOLVE_EVENT, handler);
+  }, [resolveTeleport]);
 
   useEffect(() => {
     let rafId: number | null = null;

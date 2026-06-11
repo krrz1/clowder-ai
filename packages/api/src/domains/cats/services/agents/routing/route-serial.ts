@@ -558,8 +558,24 @@ export async function* routeSerial(
       });
 
       // F24 Phase E: Bootstrap context for Session #2+
+      // #836: Reborn cats skip bootstrap — every invocation starts with zero prior context.
+      // Uses store lookup (not thread field) — Redis memberSS:* fields aren't hydrated by get().
       let bootstrapContext = '';
+      // #836: Reborn check is best-effort — transient Redis failure must not
+      // abort the invocation before bootstrap/routing. Default to non-reborn.
+      let isSerialReborn = false;
+      try {
+        isSerialReborn = deps.invocationDeps.threadStore?.isRebornSession
+          ? await Promise.resolve(deps.invocationDeps.threadStore.isRebornSession(threadId, catId as string))
+          : false;
+      } catch (rebornErr) {
+        log.warn(
+          { threadId, catId },
+          '[routeSerial] #836: isRebornSession lookup failed pre-bootstrap, defaulting to non-reborn',
+        );
+      }
       if (
+        !isSerialReborn &&
         isSessionChainEnabled(catId) &&
         deps.invocationDeps.sessionChainStore &&
         deps.invocationDeps.transcriptReader
@@ -1376,6 +1392,12 @@ export async function* routeSerial(
         if (!phaseHHit) {
           c2ExitChecked.add(1, c2BaseAttr);
         }
+        // F192 Phase D — local R1 review P1-1 fix: capture trigger here, defer addEvent
+        // emission until `storedMsgId` is bound to the CAT's verdict-bearing message
+        // (line ~1625 / ~1680). The hint message appended below is NOT the original
+        // verdict source — using its id as sample.messageId would land drilldown on
+        // the hint text, not the cat's output that triggered detection.
+        let pendingC2SampleTrigger: string | null = null;
         if (
           !phaseHHit &&
           shouldWarnVerdictWithoutPass({
@@ -1408,6 +1430,10 @@ export async function* routeSerial(
             };
             c2VerdictHintEmitted.add(1, verdictFireAttr);
             c2VerdictWithoutPassCount.add(1, verdictFireAttr);
+            // F192 Phase D — capture trigger for deferred sample emission. The actual
+            // addEvent fires after `storedMsgId` is bound to the cat's verdict message
+            // (post-storage block) so drilldown lands on real content, not on this hint.
+            pendingC2SampleTrigger = verdictFireAttr[TRIGGER] as string;
             if (deps.socketManager) {
               deps.socketManager.broadcastToRoom(`thread:${threadId}`, 'connector_message', {
                 threadId,
@@ -1615,6 +1641,9 @@ export async function* routeSerial(
               'Stream store skipped — cat_cafe_post_message callback already persisted',
             );
             if (callbackPostMessageId) {
+              // F192 Phase D: bind sample anchor in callback path so post-storage
+              // emission uses the actual cat-stored message id (via callback).
+              storedMsgId = callbackPostMessageId;
               const metadataPatch: StreamMetadataAugmentInput = {
                 ...(thinkingChunks.length > 0 ? { thinking: renderThinkingChunks(thinkingChunks) } : {}),
                 ...(firstMetadata ? { metadata: firstMetadata } : {}),
@@ -1676,6 +1705,39 @@ export async function* routeSerial(
               );
             } catch (activityErr) {
               log.warn({ catId: catId as string, err: activityErr }, 'updateParticipantActivity failed');
+            }
+          }
+          // F192 Phase D — deferred per-fire sample emission (local R1 P1-1 fix +
+          // cloud R1 P1 fix: use dedicated sample span instead of getActiveSpan).
+          //
+          // Why a fresh span and not `invocationSpanRef.current.addEvent(...)`:
+          // invokeSingleCat ends the cat invocation span in its `finally` once the
+          // generator closes. By the time control reaches here (post-storage, outside
+          // the for-await loop), the cat invocation span is ended — `.addEvent()` on
+          // an ended span is a silent no-op in the OTel JS SDK and the sample would
+          // be dropped despite the counter incrementing. A short-lived marker span
+          // parented to a still-open span (route span first, falling back to the
+          // ended invocation span as parent ref only) guarantees the event reaches
+          // LocalTraceStore via RedactingSpanProcessor (which HMACs IDs per the
+          // 782b346d0 events-redaction fix).
+          if (pendingC2SampleTrigger !== null && storedMsgId) {
+            try {
+              const parentSpan = options.routeSpan ?? invocationSpanRef.current;
+              const parentCtx = parentSpan ? trace.setSpan(context.active(), parentSpan) : context.active();
+              const sampleSpan = trace
+                .getTracer('cat-cafe-api', '0.1.0')
+                .startSpan('cat_cafe.a2a.c2.verdict_without_pass_sample', undefined, parentCtx);
+              sampleSpan.addEvent('c2.verdict_without_pass_fired', {
+                messageId: storedMsgId,
+                invocationId: ownInvocationId ?? 'unknown',
+                threadId,
+                [AGENT_ID]: catId as string,
+                [THREAD_SYSTEM_KIND]: routeThread?.systemKind ?? 'product',
+                [TRIGGER]: pendingC2SampleTrigger,
+              });
+              sampleSpan.end();
+            } catch {
+              /* best-effort sample emission */
             }
           }
         } catch (err) {
@@ -1840,6 +1902,62 @@ export async function* routeSerial(
               pendingDispatchSpans.push({ span: dispatchSpan, lastChildIndex: maxChildIdx });
             } else {
               dispatchSpan.end();
+            }
+          }
+        } else if (a2aMentions.length > 0 && catSignal?.aborted && deferA2AEnqueue) {
+          // #813 fix: When invocation is aborted (e.g., after context seal), defer @mentions
+          // to the queue instead of silently dropping them. This ensures handoff continuity
+          // even when the cat's invocation was interrupted after writing a line-start @mention.
+          //
+          // P2 gate: Do NOT recover for user-initiated cancellations (user_cancel / cancel_all).
+          // The user explicitly stopped the flow — enqueueing autoExecute A2A work afterward
+          // would contradict their intent and run work they tried to stop.
+          const abortReason = catSignal.reason;
+          const isUserInitiatedAbort = abortReason === 'user_cancel' || abortReason === 'cancel_all';
+          if (isUserInitiatedAbort) {
+            log.info(
+              { threadId, catId, abortReason, mentionCount: a2aMentions.length },
+              '#813: A2A abort-recovery suppressed — user-initiated cancellation',
+            );
+          } else {
+            for (const nextCat of a2aMentions) {
+              if (worklistEntry.a2aCount >= maxDepth) {
+                log.info(
+                  { threadId, catId: nextCat, fromCat: catId, a2aCount: worklistEntry.a2aCount, maxDepth },
+                  'A2A abort-recovery blocked: depth limit reached',
+                );
+                continue;
+              }
+              // P2: dedup — skip if target cat already has queued/active work
+              // (same guard the inline and fairness-gate paths apply via
+              // resolveRoutingDecisions → hasActiveAgent). Without this, a
+              // seal-recovery enqueue could duplicate an earlier same-turn handoff.
+              if (hasQueuedOrActiveAgentForCat?.(threadId, nextCat)) {
+                log.info(
+                  { threadId, catId: nextCat, fromCat: catId },
+                  '#813: A2A abort-recovery skipped — target already queued/active',
+                );
+                continue;
+              }
+              deferA2AEnqueue({
+                threadId,
+                userId,
+                content: storedContent,
+                source: 'agent',
+                sourceCategory: 'a2a',
+                targetCats: [nextCat],
+                callerCatId: catId,
+                messageId: storedMsgId,
+                a2aTriggerMessageId: storedMsgId,
+                autoExecute: true,
+                priority: 'normal',
+                intent: 'execute',
+              });
+              worklistEntry.a2aCount++;
+              log.info(
+                { threadId, catId: nextCat, fromCat: catId },
+                '#813: A2A mention recovered after signal abort — deferred to queue',
+              );
             }
           }
         } else if (a2aMentions.length > 0 && queuedMessagesPending && deferA2AEnqueue && !catSignal?.aborted) {

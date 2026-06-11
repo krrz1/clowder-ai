@@ -33,8 +33,12 @@ import { getThreadLiveInvocations } from '../domains/cats/services/agents/invoca
 import type { InvocationQueue } from '../domains/cats/services/agents/invocation/InvocationQueue.js';
 import type { InvocationRegistry } from '../domains/cats/services/agents/invocation/InvocationRegistry.js';
 import type { InvocationTracker } from '../domains/cats/services/agents/invocation/InvocationTracker.js';
-import type { QueueProcessor } from '../domains/cats/services/agents/invocation/QueueProcessor.js';
+import type {
+  QueueProcessor,
+  SessionContinuationCoordinatorLike,
+} from '../domains/cats/services/agents/invocation/QueueProcessor.js';
 import { reconcileZombies } from '../domains/cats/services/agents/invocation/reconcileZombies.js';
+import type { ConsumedContinuationToken } from '../domains/cats/services/agents/invocation/SessionContinuationCoordinator.js';
 import type { TaskProgressStore } from '../domains/cats/services/agents/invocation/TaskProgressStore.js';
 import { stampVisibleTurn } from '../domains/cats/services/agents/invocation/visible-turn.js';
 import type { PersistenceContext } from '../domains/cats/services/agents/routing/route-helpers.js';
@@ -58,7 +62,7 @@ import type { IMessageStore } from '../domains/cats/services/stores/ports/Messag
 import { isDelivered } from '../domains/cats/services/stores/ports/MessageStore.js';
 import type { ISummaryStore } from '../domains/cats/services/stores/ports/SummaryStore.js';
 import type { IThreadStore } from '../domains/cats/services/stores/ports/ThreadStore.js';
-import { isSystemUserMessage } from '../domains/cats/services/stores/visibility.js';
+import { isInternalNonQuotableParent, isSystemUserMessage } from '../domains/cats/services/stores/visibility.js';
 import { mergeTokenUsage, type TokenUsage } from '../domains/cats/services/types.js';
 import { buildThreadDeepLink } from '../infrastructure/connectors/connector-command-helpers.js';
 import { createModuleLogger } from '../infrastructure/logger.js';
@@ -137,6 +141,8 @@ export interface MessagesRoutesOptions {
   invocationQueue?: InvocationQueue;
   /** F39: Queue processor for auto-dequeue on invocation complete */
   queueProcessor?: QueueProcessor;
+  /** F224: Shared continuation lifecycle coordinator for direct immediate invocations. */
+  sessionContinuationCoordinator?: SessionContinuationCoordinatorLike;
   /** Test/diagnostic override for releasing invocations that never produce a provider/session event. */
   invocationStartupWatchdogMs?: number;
   /** F101: Game store for /game command interception */
@@ -149,11 +155,45 @@ export interface MessagesRoutesOptions {
   streamingHook?: StreamingHookLike;
   /** F167 Phase J: deps for auto-cancelling pending hold-ball tasks on user message */
   holdBallCancelDeps?: HoldBallCancelDeps;
-  /** F192 Phase G AC-G12: callback when magic words detected in user message */
-  onMagicWordDetected?: (hits: Array<{ word: string }>, threadId: string, catId: string | null) => void;
+  /** F192 Phase G AC-G12 / F227 归一: callback when magic words detected in a user
+   * message. messageId is the stored user-message id — the Event Memory teleport
+   * coordinate. */
+  onMagicWordDetected?: (
+    hits: Array<{ word: string }>,
+    threadId: string,
+    catId: string | null,
+    messageId: string,
+    ownerUserId: string,
+    messageExcerpt?: string,
+  ) => void;
 }
 
 const log = createModuleLogger('routes/messages');
+
+async function shouldEnqueueDirectContinuation(
+  capsule: CollaborationContinuityCapsuleV1,
+  userId: string,
+  coordinator?: SessionContinuationCoordinatorLike,
+): Promise<boolean> {
+  if (!coordinator?.resolveSessionStrategy) return true;
+  try {
+    const strategy = await coordinator.resolveSessionStrategy(capsule.threadId, capsule.catId, userId);
+    if (strategy === 'reborn') {
+      log.info(
+        { threadId: capsule.threadId, catId: capsule.catId },
+        '[messages] F224: reborn session — skipping continuation enqueue',
+      );
+      return false;
+    }
+    return true;
+  } catch (err) {
+    log.warn(
+      { err, threadId: capsule.threadId, catId: capsule.catId },
+      '[messages] F224: resolveSessionStrategy failed for continuation enqueue, defaulting to enqueue',
+    );
+    return true;
+  }
+}
 
 /**
  * F192 Phase G AC-G12: detect magic words in user message content.
@@ -164,17 +204,33 @@ async function tryDetectMagicWords(
   content: string | null | undefined,
   threadId: string,
   targetCats: string[],
+  messageId: string | null | undefined,
+  ownerUserId: string | null | undefined,
   onMagicWordDetected?: MessagesRoutesOptions['onMagicWordDetected'],
 ): Promise<void> {
-  if (!onMagicWordDetected || !content) return;
+  // F227 归一: messageId is the Event Memory teleport coordinate — never guess it
+  // from thread/time. If it is unavailable, skip rather than store a
+  // coordinate-less event.
+  if (!onMagicWordDetected || !content || !messageId) return;
+  // F227 (cloud-review P1 / 砚砚): the live write must carry the authenticated owner —
+  // skip + report rather than store an unscoped event (no unknown/default fallback).
+  if (!ownerUserId) {
+    log.warn({ threadId, messageId }, 'magic-word event skipped: message has no owner userId');
+    return;
+  }
   try {
     const { detectMagicWords } = await import('../infrastructure/harness-eval/task-outcome/magic-word-detector.js');
     const hits = detectMagicWords(content);
     if (hits.length > 0) {
-      onMagicWordDetected(hits, threadId, targetCats[0] ?? null);
+      // 砚砚 (non-blocking): pass a short excerpt of the triggering message so the
+      // Event summary carries 原话 context, not just the magic word itself.
+      const excerpt = content.length > 200 ? `${content.slice(0, 200)}…` : content;
+      onMagicWordDetected(hits, threadId, targetCats[0] ?? null, messageId, ownerUserId, excerpt);
     }
   } catch {
-    // Best-effort: don't fail message send if detection throws
+    // Best-effort: the detection/dispatch wrapper must not fail message send. The
+    // Event-write fail-loud policy lives inside onMagicWordDetected itself (it logs
+    // + observes rather than throwing), so it is not swallowed here.
   }
 }
 
@@ -419,7 +475,10 @@ export const messagesRoutes: FastifyPluginAsync<MessagesRoutesOptions> = async (
         !replyTarget ||
         replyTarget.deletedAt ||
         replyTarget.threadId !== resolvedThreadId ||
-        !isDelivered(replyTarget)
+        !isDelivered(replyTarget) ||
+        // #699 P1 (gpt52 intake review): align user-direct path with isEligibleReplyParent —
+        // system/briefing are internal, non-routable, must not be quotable (else hydrateReplyPreview leaks raw content)
+        isInternalNonQuotableParent(replyTarget)
       ) {
         replyTo = undefined;
       } else if (replyTarget.visibility === 'whisper') {
@@ -672,8 +731,15 @@ export const messagesRoutes: FastifyPluginAsync<MessagesRoutesOptions> = async (
           });
           storedUserMessageId = userMessage.id;
 
-          // F192 Phase G AC-G12: detect magic words (queued path)
-          void tryDetectMagicWords(content, resolvedThreadId, targetCats, opts.onMagicWordDetected);
+          // F192 Phase G AC-G12 / F227: detect magic words → Event Memory (queued path)
+          void tryDetectMagicWords(
+            content,
+            resolvedThreadId,
+            targetCats,
+            storedUserMessageId,
+            userId,
+            opts.onMagicWordDetected,
+          );
 
           const queueEntryId = enqueueResult.entry?.id;
           if (queueEntryId) {
@@ -911,8 +977,15 @@ export const messagesRoutes: FastifyPluginAsync<MessagesRoutesOptions> = async (
           userMessageId: storedUserMessage.id,
         });
 
-        // F192 Phase G AC-G12: detect magic words (immediate path)
-        void tryDetectMagicWords(content, resolvedThreadId, targetCats, opts.onMagicWordDetected);
+        // F192 Phase G AC-G12 / F227: detect magic words → Event Memory (immediate path)
+        void tryDetectMagicWords(
+          content,
+          resolvedThreadId,
+          targetCats,
+          storedUserMessage.id,
+          userId,
+          opts.onMagicWordDetected,
+        );
       } catch (preExecErr) {
         // Release slots — we haven't entered background coroutine yet
         opts.invocationTracker?.completeAll(resolvedThreadId, targetCats, controller);
@@ -968,6 +1041,8 @@ export const messagesRoutes: FastifyPluginAsync<MessagesRoutesOptions> = async (
 
         // F148 fix: Hoisted so abort/catch branches can ack completed cats' cursors
         const cursorBoundaries = new Map<string, string>();
+        const continuationCapsules = new Map<string, CollaborationContinuityCapsuleV1>();
+        let consumedContinuation: ConsumedContinuationToken | undefined;
 
         // F194 Phase Z3 (AC-Z3): mark chain start for finally fallback. routeExecution may
         // hang / silently exit / swallow exceptions and never reach explicit terminal write
@@ -1035,7 +1110,6 @@ export const messagesRoutes: FastifyPluginAsync<MessagesRoutesOptions> = async (
           const collectedUsage = new Map<string, TokenUsage>();
           // F070: track governance block errorCode for recoverable failure marking
           let governanceErrorCode: string | undefined;
-          const continuationCapsules = new Map<string, CollaborationContinuityCapsuleV1>();
 
           // F088 ISSUE-15: Collect per-turn content for outbound delivery to connector platforms
           const outboundTurns: Array<{
@@ -1067,6 +1141,38 @@ export const messagesRoutes: FastifyPluginAsync<MessagesRoutesOptions> = async (
             });
             await cleanupStreamingOnFailure(resolvedThreadId, createResult.invocationId, streamStartPromise, opts, log);
             return;
+          }
+
+          // F224: direct immediate invocations must consume the same pending continuation
+          // as QueueProcessor. Only single-cat content is safe to rewrite with a cat-specific prompt.
+          if (opts.sessionContinuationCoordinator && targetCats.length === 1) {
+            const singleCatId = targetCats[0]!;
+            try {
+              const prepared = await opts.sessionContinuationCoordinator.prepareInvocationContext({
+                threadId: resolvedThreadId,
+                catId: singleCatId,
+                userId,
+                content,
+              });
+              content = prepared.content;
+              consumedContinuation = prepared.consumedContinuation;
+              if (prepared.sessionPolicy === 'reborn') {
+                log.info(
+                  { threadId: resolvedThreadId, catId: singleCatId },
+                  '[messages] F224: reborn session — coordinator skipped continuation consume',
+                );
+              } else if (prepared.consumedContinuation) {
+                log.info(
+                  { threadId: resolvedThreadId, catId: singleCatId },
+                  '[messages] F224: consumed pending continuation for direct invocation',
+                );
+              }
+            } catch (err) {
+              log.warn(
+                { err, threadId: resolvedThreadId, catId: singleCatId },
+                '[messages] F224: prepareInvocationContext failed, proceeding without continuation context',
+              );
+            }
           }
 
           // F118 D2: Broadcast spawn_started immediately — fills the intent_mode blind spot.
@@ -1327,16 +1433,26 @@ export const messagesRoutes: FastifyPluginAsync<MessagesRoutesOptions> = async (
             routeChainTracker.succeed(createResult.invocationId);
 
             for (const continuationCapsule of continuationCapsules.values()) {
-              void opts.queueProcessor
+              if (
+                !(await shouldEnqueueDirectContinuation(
+                  continuationCapsule,
+                  userId,
+                  opts.sessionContinuationCoordinator,
+                ))
+              ) {
+                continue;
+              }
+              const result = await opts.queueProcessor
                 ?.enqueueContinuation({
                   threadId: resolvedThreadId,
                   userId,
                   catId: continuationCapsule.catId,
                   capsule: continuationCapsule,
                 })
-                .catch((err) =>
-                  log.warn({ err, threadId: resolvedThreadId }, 'enqueueContinuation failed (best-effort)'),
-                );
+                .catch((err) => {
+                  log.warn({ err, threadId: resolvedThreadId }, 'enqueueContinuation failed (best-effort)');
+                  return undefined;
+                });
             }
 
             // Push notification: cat(s) finished responding
@@ -1472,6 +1588,23 @@ export const messagesRoutes: FastifyPluginAsync<MessagesRoutesOptions> = async (
             }
           }
           routeChainTracker.release(createResult.invocationId);
+          if (opts.sessionContinuationCoordinator) {
+            try {
+              await opts.sessionContinuationCoordinator.commitInvocationOutcome({
+                finalStatus,
+                threadId: resolvedThreadId,
+                catId: primaryCat,
+                userId,
+                consumedContinuation,
+                producedCapsules: [...continuationCapsules.values()],
+              });
+            } catch (err) {
+              log.warn(
+                { err, threadId: resolvedThreadId, targetCats },
+                '[messages] F224: commitInvocationOutcome failed',
+              );
+            }
+          }
           // F39: Notify queue processor for auto-dequeue chain
           notifyQueueCompletion(finalStatus);
         }
@@ -1627,6 +1760,7 @@ export const messagesRoutes: FastifyPluginAsync<MessagesRoutesOptions> = async (
       ...(m.thinking ? { thinking: m.thinking } : {}),
       ...(m.extra?.rich ||
       m.extra?.crossPost ||
+      m.extra?.isExplicitPost ||
       m.extra?.stream ||
       m.extra?.targetCats ||
       m.extra?.scheduler ||
@@ -1636,6 +1770,7 @@ export const messagesRoutes: FastifyPluginAsync<MessagesRoutesOptions> = async (
             extra: {
               ...(m.extra.rich ? { rich: m.extra.rich } : {}),
               ...(m.extra.crossPost ? { crossPost: m.extra.crossPost } : {}),
+              ...(m.extra.isExplicitPost ? { isExplicitPost: true } : {}),
               ...(m.extra.stream ? { stream: m.extra.stream } : {}),
               ...(m.extra.targetCats ? { targetCats: m.extra.targetCats } : {}),
               ...(m.extra.scheduler ? { scheduler: m.extra.scheduler } : {}),

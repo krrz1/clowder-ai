@@ -484,6 +484,100 @@ describe('POST /api/messages deliveryMode', () => {
     assert.equal(options.queueHasQueuedMessages('thread-x'), false);
   });
 
+  it('immediate direct execution applies pending continuation before routeExecution', async () => {
+    deps.invocationTracker.has.mock.mockImplementation(() => false);
+    const capsule = completeCapsuleForSeal(
+      buildCapsuleFromRouteState({
+        threadId: 'thread-1',
+        catId: 'opus',
+        mode: 'independent',
+        a2aEnabled: true,
+      }),
+      {
+        invocationId: 'inv-pending',
+        createdAt: Date.now(),
+        seal: { sessionId: 'sess-pending', sessionSeq: 1, reason: 'threshold' },
+      },
+    );
+    const consumedContinuation = { threadId: 'thread-1', catId: 'opus', userId: 'user-1', capsule };
+    deps.sessionContinuationCoordinator = {
+      prepareInvocationContext: mock.fn(async ({ content }) => ({
+        content: `CONTINUATION\n\n${content}`,
+        consumedContinuation,
+        sessionPolicy: 'resume',
+      })),
+      commitInvocationOutcome: mock.fn(async () => {}),
+    };
+
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/messages',
+      headers: { 'x-cat-cafe-user': 'user-1', 'content-type': 'application/json' },
+      payload: { content: '用户继续', threadId: 'thread-1', deliveryMode: 'immediate' },
+    });
+    assert.equal(res.statusCode, 200);
+
+    await new Promise((r) => setTimeout(r, 50));
+
+    assert.equal(deps.sessionContinuationCoordinator.prepareInvocationContext.mock.calls.length, 1);
+    assert.deepEqual(deps.sessionContinuationCoordinator.prepareInvocationContext.mock.calls[0].arguments[0], {
+      threadId: 'thread-1',
+      catId: 'opus',
+      userId: 'user-1',
+      content: '用户继续',
+    });
+    assert.equal(deps.router.routeExecution.mock.calls[0].arguments[1], 'CONTINUATION\n\n用户继续');
+
+    assert.equal(deps.sessionContinuationCoordinator.commitInvocationOutcome.mock.calls.length, 1);
+    const commitInput = deps.sessionContinuationCoordinator.commitInvocationOutcome.mock.calls[0].arguments[0];
+    assert.equal(commitInput.finalStatus, 'succeeded');
+    assert.equal(commitInput.consumedContinuation, consumedContinuation);
+  });
+
+  it('immediate direct execution restores consumed continuation through coordinator on failure', async () => {
+    deps.invocationTracker.has.mock.mockImplementation(() => false);
+    const capsule = completeCapsuleForSeal(
+      buildCapsuleFromRouteState({
+        threadId: 'thread-1',
+        catId: 'opus',
+        mode: 'independent',
+        a2aEnabled: true,
+      }),
+      {
+        invocationId: 'inv-pending-fail',
+        createdAt: Date.now(),
+        seal: { sessionId: 'sess-pending-fail', sessionSeq: 1, reason: 'threshold' },
+      },
+    );
+    const consumedContinuation = { threadId: 'thread-1', catId: 'opus', userId: 'user-1', capsule };
+    deps.sessionContinuationCoordinator = {
+      prepareInvocationContext: mock.fn(async ({ content }) => ({
+        content: `CONTINUATION\n\n${content}`,
+        consumedContinuation,
+        sessionPolicy: 'resume',
+      })),
+      commitInvocationOutcome: mock.fn(async () => {}),
+    };
+    deps.router.routeExecution.mock.mockImplementation(async function* () {
+      throw new Error('route failed');
+    });
+
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/messages',
+      headers: { 'x-cat-cafe-user': 'user-1', 'content-type': 'application/json' },
+      payload: { content: '用户继续失败', threadId: 'thread-1', deliveryMode: 'immediate' },
+    });
+    assert.equal(res.statusCode, 200);
+
+    await new Promise((r) => setTimeout(r, 50));
+
+    assert.equal(deps.sessionContinuationCoordinator.commitInvocationOutcome.mock.calls.length, 1);
+    const commitInput = deps.sessionContinuationCoordinator.commitInvocationOutcome.mock.calls[0].arguments[0];
+    assert.equal(commitInput.finalStatus, 'failed');
+    assert.equal(commitInput.consumedContinuation, consumedContinuation);
+  });
+
   it('immediate execution schedules continuation when route emits seal capsule and succeeds', async () => {
     deps.invocationTracker.has.mock.mockImplementation(() => false);
     const capsule = completeCapsuleForSeal(
@@ -525,6 +619,104 @@ describe('POST /api/messages deliveryMode', () => {
     assert.equal(call.userId, 'user-1');
     assert.equal(call.catId, 'opus');
     assert.equal(call.capsule.seal.sessionId, 'sess-1');
+  });
+
+  it('immediate success persists produced continuation even when it was already queued', async () => {
+    deps.invocationTracker.has.mock.mockImplementation(() => false);
+    const capsule = completeCapsuleForSeal(
+      buildCapsuleFromRouteState({
+        threadId: 'thread-1',
+        catId: 'opus',
+        mode: 'independent',
+        a2aEnabled: true,
+      }),
+      {
+        invocationId: 'inv-seal-queued',
+        createdAt: Date.now(),
+        seal: { sessionId: 'sess-queued', sessionSeq: 1, reason: 'threshold' },
+      },
+    );
+    deps.sessionContinuationCoordinator = {
+      prepareInvocationContext: mock.fn(async ({ content }) => ({ content, sessionPolicy: 'resume' })),
+      commitInvocationOutcome: mock.fn(async () => {}),
+    };
+    deps.router.routeExecution.mock.mockImplementation(async function* () {
+      yield {
+        type: 'system_info',
+        catId: 'opus',
+        content: JSON.stringify({ type: 'session_seal_requested', continuityCapsule: capsule }),
+        timestamp: Date.now(),
+      };
+      yield { type: 'done', catId: 'opus', timestamp: Date.now() };
+    });
+
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/messages',
+      headers: { 'x-cat-cafe-user': 'user-1', 'content-type': 'application/json' },
+      payload: { content: '触发 seal 并排队', threadId: 'thread-1', deliveryMode: 'immediate' },
+    });
+    assert.equal(res.statusCode, 200);
+
+    await new Promise((r) => setTimeout(r, 50));
+
+    assert.equal(deps.queueProcessor.enqueueContinuation.mock.calls.length, 1);
+    assert.equal(deps.sessionContinuationCoordinator.commitInvocationOutcome.mock.calls.length, 1);
+    const commitInput = deps.sessionContinuationCoordinator.commitInvocationOutcome.mock.calls[0].arguments[0];
+    assert.equal(commitInput.finalStatus, 'succeeded');
+    assert.deepEqual(Array.from(commitInput.producedCapsules ?? []), [capsule]);
+  });
+
+  it('immediate success does not auto-enqueue produced continuation for reborn sessions', async () => {
+    deps.invocationTracker.has.mock.mockImplementation(() => false);
+    const capsule = completeCapsuleForSeal(
+      buildCapsuleFromRouteState({
+        threadId: 'thread-1',
+        catId: 'opus',
+        mode: 'independent',
+        a2aEnabled: true,
+      }),
+      {
+        invocationId: 'inv-reborn-seal',
+        createdAt: Date.now(),
+        seal: { sessionId: 'sess-reborn', sessionSeq: 1, reason: 'threshold' },
+      },
+    );
+    deps.sessionContinuationCoordinator = {
+      prepareInvocationContext: mock.fn(async ({ content }) => ({ content, sessionPolicy: 'reborn' })),
+      resolveSessionStrategy: mock.fn(async () => 'reborn'),
+      commitInvocationOutcome: mock.fn(async () => {}),
+    };
+    deps.router.routeExecution.mock.mockImplementation(async function* () {
+      yield {
+        type: 'system_info',
+        catId: 'opus',
+        content: JSON.stringify({ type: 'session_seal_requested', continuityCapsule: capsule }),
+        timestamp: Date.now(),
+      };
+      yield { type: 'done', catId: 'opus', timestamp: Date.now() };
+    });
+
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/messages',
+      headers: { 'x-cat-cafe-user': 'user-1', 'content-type': 'application/json' },
+      payload: { content: '触发 reborn seal', threadId: 'thread-1', deliveryMode: 'immediate' },
+    });
+    assert.equal(res.statusCode, 200);
+
+    await new Promise((r) => setTimeout(r, 50));
+
+    assert.deepEqual(deps.sessionContinuationCoordinator.resolveSessionStrategy.mock.calls[0].arguments, [
+      'thread-1',
+      'opus',
+      'user-1',
+    ]);
+    assert.equal(deps.queueProcessor.enqueueContinuation.mock.calls.length, 0);
+    assert.equal(deps.sessionContinuationCoordinator.commitInvocationOutcome.mock.calls.length, 1);
+    const commitInput = deps.sessionContinuationCoordinator.commitInvocationOutcome.mock.calls[0].arguments[0];
+    assert.equal(commitInput.finalStatus, 'succeeded');
+    assert.deepEqual(Array.from(commitInput.producedCapsules ?? []), [capsule]);
   });
 
   it('immediate multi-cat execution schedules continuation for the capsule owner cat', async () => {
@@ -864,5 +1056,87 @@ describe('POST /api/messages deliveryMode', () => {
 
     // Should NOT have created InvocationRecord
     assert.equal(deps.invocationRecordStore.create.mock.calls.length, 0);
+  });
+});
+
+describe('POST /api/messages magic word instrumentation (F227 砚砚 P1 — detect→callback→messageId)', () => {
+  let app;
+  let deps;
+  let magicWordCalls;
+
+  beforeEach(async () => {
+    magicWordCalls = [];
+    deps = buildDeps({
+      onMagicWordDetected: (hits, threadId, catId, messageId, ownerUserId, messageExcerpt) => {
+        magicWordCalls.push({ hits, threadId, catId, messageId, ownerUserId, messageExcerpt });
+      },
+    });
+    const { messagesRoutes } = await import('../dist/routes/messages.js');
+    app = Fastify();
+    await app.register(messagesRoutes, deps);
+    await app.ready();
+  });
+
+  afterEach(async () => {
+    if (app) await app.close();
+  });
+
+  it('fires onMagicWordDetected with the PERSISTED messageId (not guessed)', async () => {
+    deps.invocationTracker.has.mock.mockImplementation(() => true); // queue path
+
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/messages',
+      headers: { 'x-cat-cafe-user': 'user-1', 'content-type': 'application/json' },
+      payload: { content: '这个方案是脚手架，得重写', threadId: 'thread-1', deliveryMode: 'queue' },
+    });
+    assert.equal(res.statusCode, 202);
+    const persistedMessageId = JSON.parse(res.body).userMessageId;
+
+    // tryDetectMagicWords is fire-and-forget (async dynamic import) — let it settle.
+    await new Promise((r) => setTimeout(r, 80));
+
+    assert.equal(magicWordCalls.length, 1, 'callback should fire exactly once');
+    const call = magicWordCalls[0];
+    assert.equal(call.hits[0].word, '脚手架');
+    assert.equal(call.threadId, 'thread-1');
+    // The whole point of the instrumentation-gap fix: messageId === persisted user message id
+    assert.equal(call.messageId, persistedMessageId);
+    assert.equal(call.ownerUserId, 'user-1', 'F227 P1: owner = the authenticated sender (queued path)');
+    assert.ok(call.messageExcerpt?.includes('脚手架'), 'excerpt carries 原话 context');
+  });
+
+  it('does not fire the callback when the message has no magic word', async () => {
+    deps.invocationTracker.has.mock.mockImplementation(() => true);
+
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/messages',
+      headers: { 'x-cat-cafe-user': 'user-1', 'content-type': 'application/json' },
+      payload: { content: '普通消息，没有触发词', threadId: 'thread-1', deliveryMode: 'queue' },
+    });
+    assert.equal(res.statusCode, 202);
+    await new Promise((r) => setTimeout(r, 80));
+    assert.equal(magicWordCalls.length, 0);
+  });
+
+  it('fires on the IMMEDIATE path too with the persisted messageId (砚砚 R2 P1: both paths)', async () => {
+    deps.invocationTracker.has.mock.mockImplementation(() => false); // immediate path (no active invocation)
+
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/messages',
+      headers: { 'x-cat-cafe-user': 'user-1', 'content-type': 'application/json' },
+      payload: { content: '这个直接重写吧，脚手架', threadId: 'thread-1', deliveryMode: 'immediate' },
+    });
+    assert.equal(res.statusCode, 200);
+    const persistedMessageId = JSON.parse(res.body).userMessageId;
+
+    await new Promise((r) => setTimeout(r, 80));
+
+    assert.equal(magicWordCalls.length, 1, 'immediate path should also fire the callback');
+    assert.equal(magicWordCalls[0].hits[0].word, '脚手架');
+    assert.equal(magicWordCalls[0].messageId, persistedMessageId);
+    assert.equal(magicWordCalls[0].ownerUserId, 'user-1', 'F227 P1: owner = the authenticated sender (immediate path)');
   });
 });

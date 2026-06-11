@@ -279,6 +279,8 @@ export interface ChatMessage {
     };
     /** F098-C1: Explicit target cats from post_message API */
     targetCats?: string[];
+    /** #814: True when message originated from an explicit post_message callback (not stream duplicate) */
+    isExplicitPost?: boolean;
     /** Scheduler presentation metadata (hidden trigger / ephemeral lifecycle toast) */
     scheduler?: SchedulerMessageExtra['scheduler'];
     /** F118 AC-C3: Timeout diagnostics for enhanced error display */
@@ -638,6 +640,29 @@ export interface PresentationLockSnapshot {
   line: number | null;
   tabs: string[];
   scrollTop: number | null;
+}
+
+/** F226: Presentation Surface — file/md tear-off floating window for demo mode */
+export interface PresentationSurfaceContent {
+  worktreeId: string | null;
+  filePath: string;
+  tabs: string[];
+  fileKind: 'file' | 'image' | 'markdown';
+  renderMode: 'rendered' | 'raw';
+  line: number | null;
+  scrollTop: number | null;
+  title: string;
+}
+
+export interface PresentationSurfaceState {
+  content: PresentationSurfaceContent;
+  pos: { x: number; y: number };
+  size: { width: number; height: number };
+  minimized: boolean;
+  /** F226 尺寸快捷: 一键适配 PPT 的放大态 */
+  maximized: boolean;
+  /** geometry before maximize — toggle restores the user's manual size/pos so they needn't re-drag */
+  preMaximizeGeometry: { pos: { x: number; y: number }; size: { width: number; height: number } } | null;
 }
 
 /** F097: CLI Output unified event stream */

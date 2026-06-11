@@ -82,6 +82,7 @@ import {
   writeOpenCodeRuntimeConfig,
 } from '../providers/opencode-config-template.js';
 import { appendTranscriptPathHints } from '../providers/transcript-path-hints.js';
+import { buildContextManagementHint, queueContextHint, takeContextHintPrefix } from './context-management-hint.js';
 
 const log = createModuleLogger('invoke');
 const tracer = trace.getTracer('cat-cafe-api', '0.1.0');
@@ -956,6 +957,31 @@ export async function* invokeSingleCat(deps: InvocationDeps, params: InvocationP
       try {
         const thread = await preflightRace(Promise.resolve(threadStore.get(threadId)), 'threadStore.get', signal);
         if (thread?.createdAt) threadCreatedAt = thread.createdAt;
+        // #836: Reborn session strategy — force new session every invocation.
+        // Uses store lookup (isRebornSession) instead of thread field because
+        // Redis stores strategy in separate hash fields not hydrated by get().
+        // Optional chaining: test mocks may omit isRebornSession (absent = false).
+        // Best-effort: a transient Redis failure must not skip workspace resolution
+        // below — wrap in its own try/catch, defaulting to non-reborn.
+        let isReborn = false;
+        try {
+          isReborn = threadStore.isRebornSession
+            ? await preflightRace(
+                Promise.resolve(threadStore.isRebornSession(threadId, catId as string)),
+                'isRebornSession',
+                signal,
+              )
+            : false;
+        } catch (rebornErr) {
+          log.warn(
+            { catId, threadId, err: rebornErr },
+            '#836: isRebornSession lookup failed pre-invoke, defaulting to non-reborn',
+          );
+        }
+        if (isReborn) {
+          sessionId = undefined;
+          log.info({ catId, threadId }, '#836: reborn session strategy — forcing new session');
+        }
         if (thread?.projectPath && thread.projectPath !== 'default') {
           // F101: Game threads use virtual projectPaths (e.g. 'games/werewolf') for
           // categorization only — they are not real filesystem directories. Skip them
@@ -1531,6 +1557,15 @@ export async function* invokeSingleCat(deps: InvocationDeps, params: InvocationP
       injectSystemPrompt && params.systemPrompt
         ? `${params.systemPrompt}\n\n---\n\n${promptWithMission}`
         : `${promptWithMission}`;
+
+    // F225 软层: deliver a pending context-management hint into the cat's actual
+    // prompt (a system_info output can't reach cat cognition — see
+    // context-management-hint). Queued on the prior warn turn; independent of
+    // injectSystemPrompt so it lands even on resumes that skip identity re-injection.
+    const contextHintPrefix = takeContextHintPrefix(compressionKey);
+    if (contextHintPrefix) {
+      effectivePrompt = `${contextHintPrefix}\n\n---\n\n${effectivePrompt}`;
+    }
 
     effectivePrompt = appendTranscriptPathHints(effectivePrompt, TRANSCRIPT_DIR, threadId);
 
@@ -2136,9 +2171,24 @@ export async function* invokeSingleCat(deps: InvocationDeps, params: InvocationP
                     switch (action.type) {
                       case 'none':
                         break;
-                      case 'warn':
-                        // warn is already emitted via context_health system_info above
+                      case 'warn': {
+                        // F225 软层: queue a cat-facing hint for the NEXT prompt. A
+                        // system_info output would never reach the cat (routing feeds only
+                        // `text` into previousResponses; ContextAssembler drops
+                        // userId='system') — so we ride the prompt-injection channel
+                        // (consumed at effectivePrompt assembly, ~line 1538). Nudges the cat
+                        // to run the context-self-management 3-axis self-check — NOT "handoff
+                        // now" (handoff-vs-compress is the cat's judgment). cKey matches the
+                        // compressionKey used there: `${userId}:${catId}:${threadId}`.
+                        queueContextHint(
+                          cKey,
+                          buildContextManagementHint({
+                            source: health.source,
+                            compressionCount: activeRecord?.compressionCount ?? 0,
+                          }),
+                        );
                         break;
+                      }
                       case 'seal':
                       case 'seal_after_compress': {
                         if (activeRecord) {
